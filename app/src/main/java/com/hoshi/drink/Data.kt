@@ -21,6 +21,7 @@ data class DrinkSettings(
     val stopAtGoal: Boolean = true,
     val reminderStyle: ReminderStyle = ReminderStyle.SOUND,
     val preciseReminders: Boolean = false,
+    val repeatVibration: Boolean = false,
 )
 
 enum class ReminderStyle(val label: String, val sound: Boolean, val vibrate: Boolean, val channelId: String) {
@@ -45,6 +46,7 @@ class DrinkRepository(context: Context) : SQLiteOpenHelper(context.applicationCo
         end = prefs.getInt("end", 1320), stopAtGoal = prefs.getBoolean("stopAtGoal", true),
         reminderStyle = ReminderStyle.entries.firstOrNull { it.name == prefs.getString("reminderStyle", null) } ?: ReminderStyle.SOUND,
         preciseReminders = prefs.getBoolean("preciseReminders", false),
+        repeatVibration = prefs.getBoolean("repeatVibration", false),
     )
 
     fun save(settings: DrinkSettings) {
@@ -53,7 +55,8 @@ class DrinkRepository(context: Context) : SQLiteOpenHelper(context.applicationCo
         check(prefs.edit().putInt("goal", settings.goal).putBoolean("enabled", settings.enabled)
             .putInt("interval", settings.interval).putInt("start", settings.start)
             .putInt("end", settings.end).putBoolean("stopAtGoal", settings.stopAtGoal)
-            .putString("reminderStyle", settings.reminderStyle.name).putBoolean("preciseReminders", settings.preciseReminders).commit())
+            .putString("reminderStyle", settings.reminderStyle.name).putBoolean("preciseReminders", settings.preciseReminders)
+            .putBoolean("repeatVibration", settings.repeatVibration).commit())
     }
 
     fun all(): List<Drink> = readableDatabase.query("drinks", null, null, null, null, null, "timestamp DESC, id DESC").use { cursor ->

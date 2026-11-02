@@ -22,11 +22,11 @@ class ReminderPolicyTest {
     @Test fun beforeWindowSchedulesStart() {
         assertEquals(at("08:00"), ReminderPolicy.next(at("06:30"), settings, false))
     }
-    @Test fun withinWindowUsesInterval() {
-        assertEquals(at("13:30"), ReminderPolicy.next(at("12:30"), settings, false))
+    @Test fun withinWindowStaysAlignedToStart() {
+        assertEquals(at("13:00"), ReminderPolicy.next(at("12:30"), settings, false))
     }
-    @Test fun intervalEndingAtBoundaryIsAllowed() {
-        assertEquals(at("22:00"), ReminderPolicy.next(at("21:00"), settings, false))
+    @Test fun endTimeIsExcludedEvenWhenItMatchesAnInterval() {
+        assertEquals(at("08:00").plusDays(1), ReminderPolicy.next(at("21:00"), settings, false))
     }
     @Test fun intervalBeyondEndMovesToTomorrow() {
         assertEquals(at("08:00").plusDays(1), ReminderPolicy.next(at("21:30"), settings, false))
@@ -47,7 +47,8 @@ class ReminderPolicyTest {
         assertFalse(ReminderPolicy.mayNotify(at("07:59"), settings, false))
         assertFalse(ReminderPolicy.mayNotify(at("22:01"), settings, false))
         assertTrue(ReminderPolicy.mayNotify(at("08:00"), settings, false))
-        assertTrue(ReminderPolicy.mayNotify(at("22:00"), settings, false))
+        assertTrue(ReminderPolicy.mayNotify(at("21:59"), settings, false))
+        assertFalse(ReminderPolicy.mayNotify(at("22:00"), settings, false))
     }
     @Test fun disabledRemindersNeverNotify() {
         assertFalse(ReminderPolicy.mayNotify(at("12:00"), settings.copy(enabled = false), false))
@@ -58,5 +59,24 @@ class ReminderPolicyTest {
         assertEquals(8, next.hour)
         assertEquals(1, next.dayOfMonth)
         assertEquals(-5 * 3600, next.offset.totalSeconds)
+    }
+    @Test fun tenToEighteenThirtyHasExactlyNineHourlySlots() {
+        val hourly = settings.copy(start = 600, end = 1110)
+        assertEquals((600..1080 step 60).toList(), ReminderPolicy.dailyTimes(hourly).map { it.hour * 60 + it.minute })
+        assertEquals(at("10:00"), ReminderPolicy.next(at("09:59"), hourly, false))
+        assertEquals(at("18:00"), ReminderPolicy.next(at("17:40"), hourly, false))
+        assertEquals(at("10:00").plusDays(1), ReminderPolicy.next(at("18:00"), hourly, false))
+        assertFalse(ReminderPolicy.mayNotify(at("18:30"), hourly, false))
+    }
+    @Test fun openingLoggingOrDelayedDeliveryDoesNotShiftLaterSlots() {
+        val hourly = settings.copy(start = 600, end = 1110)
+        assertEquals(at("11:00"), ReminderPolicy.next(at("10:07"), hourly, false))
+        assertEquals(at("11:00"), ReminderPolicy.next(at("10:20"), hourly, false))
+        assertEquals(at("12:00"), ReminderPolicy.next(at("11:00"), hourly, false))
+    }
+    @Test fun nonHourlyIntervalsUseTheChosenStartTime() {
+        val ninetyMinutes = settings.copy(start = 615, end = 1110, interval = 90)
+        assertEquals(at("11:45"), ReminderPolicy.next(at("10:20"), ninetyMinutes, false))
+        assertEquals(at("17:45"), ReminderPolicy.next(at("17:00"), ninetyMinutes, false))
     }
 }

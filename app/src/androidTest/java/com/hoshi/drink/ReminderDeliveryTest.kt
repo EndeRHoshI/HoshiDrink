@@ -89,7 +89,7 @@ class ReminderDeliveryTest {
             val settings = original.copy(enabled = true, start = 0, end = 1439, stopAtGoal = false, reminderStyle = ReminderStyle.VIBRATE)
             try {
                 repo.save(settings)
-                prefs.edit().putLong("due", System.currentTimeMillis() - 1000).putString("token", "dedup-test").commit()
+                prefs.edit().putLong("due", System.currentTimeMillis() - 1000).putString("token", "dedup-test").putInt("policyVersion", Reminders.POLICY_VERSION).commit()
                 Reminders.deliver(context, "dedup-test")
                 await { manager.activeNotifications.any { it.id == 1001 } }
                 val posted = manager.activeNotifications.single { it.id == 1001 }
@@ -124,7 +124,7 @@ class ReminderDeliveryTest {
                 shell("input keyevent KEYCODE_SLEEP")
                 assertTrue(shell("dumpsys deviceidle force-idle").contains("deep idle"))
                 val due = System.currentTimeMillis() + 2000
-                prefs.edit().putLong("due", due).putString("token", "idle-test").commit()
+                prefs.edit().putLong("due", due).putString("token", "idle-test").putInt("policyVersion", Reminders.POLICY_VERSION).commit()
                 val alarm = PendingIntent.getBroadcast(context, 1002,
                     Intent(context, ReminderReceiver::class.java).setAction("com.hoshi.drink.REMIND").putExtra("token", "idle-test"),
                     PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)

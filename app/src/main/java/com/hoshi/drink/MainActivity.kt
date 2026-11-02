@@ -89,6 +89,7 @@ private val Scheme = lightColorScheme(primary = Forest, onPrimary = Color.White,
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (intent?.action == Reminders.ACTION_OPEN_AND_STOP) Reminders.stopVibration(this)
         enableEdgeToEdge(
             statusBarStyle = SystemBarStyle.light(
                 scrim = android.graphics.Color.TRANSPARENT,
@@ -101,6 +102,12 @@ class MainActivity : ComponentActivity() {
         )
         Reminders.createChannel(this)
         setContent { MaterialTheme(colorScheme = Scheme) { DrinkApp() } }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        if (intent.action == Reminders.ACTION_OPEN_AND_STOP) Reminders.stopVibration(this)
     }
 }
 
@@ -476,6 +483,16 @@ private fun SettingsScreen(settings: DrinkSettings, onSettings: (DrinkSettings) 
         HorizontalDivider(color = Line)
         Spacer(Modifier.height(28.dp))
         SectionTitle("饮水提醒", "")
+        OutlinedButton(onClick = {
+            Reminders.createChannel(context, ReminderStyle.VIBRATE)
+            onSettings(settings.copy(start = 10 * 60, end = 18 * 60 + 30, interval = 60,
+                reminderStyle = ReminderStyle.VIBRATE, preciseReminders = true, stopAtGoal = false))
+            scope.launch { snackbar.showSnackbar(if (settings.enabled) "已设置整点震动" else "已设置整点震动，开启提醒后生效") }
+        }, modifier = Modifier.padding(top = 14.dp), shape = RoundedCornerShape(6.dp)) {
+            Icon(Icons.Outlined.Alarm, null, Modifier.size(17.dp))
+            Spacer(Modifier.width(6.dp))
+            Text("10:00–18:30 整点震动", fontSize = 12.sp)
+        }
         SettingSwitch("开启提醒", "在设定的时间里，记得补充水分", Icons.Outlined.NotificationsNone, settings.enabled, ::enable)
         if (!permission) {
             Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(6.dp)).background(Color(0xFFF7EDE7))
@@ -506,6 +523,17 @@ private fun SettingsScreen(settings: DrinkSettings, onSettings: (DrinkSettings) 
                 }
             }
         }
+        if (settings.reminderStyle == ReminderStyle.VIBRATE) {
+            SettingSwitch("持续震动", "规律循环，直到手动停止", Icons.Outlined.Vibration, settings.repeatVibration) {
+                onSettings(settings.copy(repeatVibration = it))
+            }
+            if (settings.repeatVibration) {
+                OutlinedButton(onClick = { Reminders.stopVibration(context) }, shape = RoundedCornerShape(6.dp)) {
+                    Icon(Icons.Outlined.StopCircle, null, Modifier.size(17.dp))
+                    Spacer(Modifier.width(6.dp)); Text("停止震动", fontSize = 12.sp)
+                }
+            }
+        }
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             OutlinedButton(onClick = { notificationAction(true) }, shape = RoundedCornerShape(6.dp)) {
                 Icon(Icons.Outlined.NotificationsActive, null, Modifier.size(17.dp))
@@ -518,7 +546,7 @@ private fun SettingsScreen(settings: DrinkSettings, onSettings: (DrinkSettings) 
                     .putExtra(Settings.EXTRA_CHANNEL_ID, settings.reminderStyle.channelId))
             }) { Icon(Icons.Outlined.Tune, "系统通知设置", tint = Forest, modifier = Modifier.size(20.dp)) }
         }
-        Text("声音和震动以系统通知设置为准；勿扰模式可能使提醒静音。", fontSize = 11.sp, color = Muted, lineHeight = 17.sp, modifier = Modifier.padding(top = 5.dp))
+        Text("声音和通知震动以系统设置为准；静音震动仍受勿扰及设备震动设置限制。", fontSize = 11.sp, color = Muted, lineHeight = 17.sp, modifier = Modifier.padding(top = 5.dp))
         Spacer(Modifier.height(22.dp))
         Text("提醒间隔", fontSize = 14.sp, fontWeight = FontWeight.Medium)
         Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(top = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -531,7 +559,11 @@ private fun SettingsScreen(settings: DrinkSettings, onSettings: (DrinkSettings) 
             TimeSetting("开始时间", settings.start, Modifier.weight(1f)) { pickTime(true) }
             TimeSetting("结束时间", settings.end, Modifier.weight(1f)) { pickTime(false) }
         }
-        Text("仅在此时段提醒。", fontSize = 11.sp, color = Muted, modifier = Modifier.padding(top = 12.dp, bottom = 12.dp))
+        val dailyTimes = ReminderPolicy.dailyTimes(settings).map { it.format(DateTimeFormatter.ofPattern("HH:mm")) }
+        val timeSummary = if (dailyTimes.size <= 12) dailyTimes.joinToString(" · ")
+            else dailyTimes.take(3).joinToString(" · ") + " … " + dailyTimes.last() + "（共 ${dailyTimes.size} 次）"
+        Text("每日提醒时刻", fontSize = 12.sp, color = Muted, modifier = Modifier.padding(top = 16.dp))
+        Text(timeSummary, fontSize = 13.sp, color = Forest, lineHeight = 21.sp, modifier = Modifier.padding(top = 7.dp, bottom = 12.dp))
         SettingSwitch("达标后暂停", "当天完成目标后，次日再提醒", Icons.Outlined.CheckCircle, settings.stopAtGoal) { onSettings(settings.copy(stopAtGoal = it)) }
         HorizontalDivider(color = Line)
         Spacer(Modifier.height(28.dp))

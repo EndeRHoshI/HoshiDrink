@@ -125,7 +125,7 @@ class DrinkStorageTest {
                 Reminders.createChannel(context)
                 assertTrue(Reminders.permission(context))
                 val pending = context.getSharedPreferences("reminder_schedule", 0)
-                pending.edit().putLong("due", System.currentTimeMillis() - 1000).putString("token", "worker-test").commit()
+                pending.edit().putLong("due", System.currentTimeMillis() - 1000).putString("token", "worker-test").putInt("policyVersion", Reminders.POLICY_VERSION).commit()
                 TestListenableWorkerBuilder<ReminderWorker>(context).setInputData(workDataOf("token" to "worker-test")).build().doWork()
                 val deadline = SystemClock.elapsedRealtime() + 5000
                 while (manager.activeNotifications.none { it.id == 1001 } && SystemClock.elapsedRealtime() < deadline) SystemClock.sleep(50)
@@ -133,7 +133,7 @@ class DrinkStorageTest {
                 manager.cancel(1001)
                 while (manager.activeNotifications.any { it.id == 1001 } && SystemClock.elapsedRealtime() < deadline) SystemClock.sleep(50)
                 repo.save(original.copy(enabled = false))
-                pending.edit().putLong("due", System.currentTimeMillis() - 1000).putString("token", "disabled-test").commit()
+                pending.edit().putLong("due", System.currentTimeMillis() - 1000).putString("token", "disabled-test").putInt("policyVersion", Reminders.POLICY_VERSION).commit()
                 TestListenableWorkerBuilder<ReminderWorker>(context).setInputData(workDataOf("token" to "disabled-test")).build().doWork()
                 assertFalse(manager.activeNotifications.any { it.id == 1001 })
             } finally {

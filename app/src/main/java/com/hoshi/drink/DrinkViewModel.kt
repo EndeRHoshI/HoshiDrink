@@ -39,13 +39,23 @@ class DrinkViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
     fun refresh() = mutate(resetReminder = false) { }
-    fun add(amount: Int) = mutate { repo.add(amount) }
+    fun add(amount: Int) = mutate {
+        repo.add(amount)
+        Reminders.stopVibration(getApplication())
+    }
     fun delete(drink: Drink) = mutate { repo.delete(drink.id) }
     fun restore(drink: Drink) = mutate { repo.restore(drink) }
     fun settings(value: DrinkSettings) {
         val previous = mutableState.value.settings
-        val affectsTime = previous.copy(reminderStyle = value.reminderStyle, preciseReminders = value.preciseReminders) != value
-        mutate(resetReminder = affectsTime) { repo.save(value) }
+        val affectsTime = previous.copy(reminderStyle = value.reminderStyle, preciseReminders = value.preciseReminders,
+            repeatVibration = value.repeatVibration) != value
+        mutate(resetReminder = affectsTime) {
+            repo.save(value)
+            if (!value.repeatVibration || value.reminderStyle != ReminderStyle.VIBRATE ||
+                (previous.enabled && !value.enabled)) {
+                Reminders.stopVibration(getApplication())
+            }
+        }
     }
     fun clearError() { mutableState.value = mutableState.value.copy(error = null) }
     override fun onCleared() { repo.close() }

@@ -10,8 +10,13 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.AudioAttributes
+import android.media.AudioManager
 import android.media.RingtoneManager
 import android.os.Build
+import android.os.VibrationAttributes
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.os.VibratorManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
@@ -33,6 +38,28 @@ object Reminders {
     private const val TOKEN = "token"
     private const val DUE = "due"
     private const val BACKUP_DELAY = 5 * 60 * 1000L
+    // Invalidate rolling countdowns saved by earlier app versions.
+    internal const val POLICY_VERSION = 2
+    private const val REPEATING_NOTIFICATION = 1004
+    const val ACTION_OPEN_AND_STOP = "com.hoshi.drink.OPEN_AND_STOP"
+
+    @Suppress("DEPRECATION")
+    private fun vibrator(context: Context): Vibrator =
+        if (Build.VERSION.SDK_INT >= 31) context.getSystemService(VibratorManager::class.java).defaultVibrator
+        else context.getSystemService(Vibrator::class.java)
+
+    @Synchronized
+    fun stopVibration(context: Context) {
+        val runtime = context.getSharedPreferences("vibration_runtime", Context.MODE_PRIVATE)
+        try {
+            if (runtime.getBoolean("repeating", false)) vibrator(context).cancel()
+        } catch (error: RuntimeException) {
+            Log.w("DrinkReminder", "Unable to cancel vibration", error)
+        } finally {
+            runtime.edit().putBoolean("repeating", false).apply()
+            context.getSystemService(NotificationManager::class.java).cancel(REPEATING_NOTIFICATION)
+        }
+    }
 
     private fun preferences(context: Context) = context.getSharedPreferences("reminder_schedule", Context.MODE_PRIVATE)
 
@@ -45,6 +72,46 @@ object Reminders {
         context.getSystemService(AlarmManager::class.java).canScheduleExactAlarms()
 
     private fun currentSettings(context: Context) = DrinkRepository(context).use { it.settings() }
+
+    private fun manualVibrator(context: Context, settings: DrinkSettings, repeat: Boolean): Vibrator? {
+        if (!settings.reminderStyle.vibrate) return null
+        val silent = context.getSystemService(AudioManager::class.java).ringerMode == AudioManager.RINGER_MODE_SILENT
+        if (repeat) {
+            if (!settings.repeatVibration || settings.reminderStyle != ReminderStyle.VIBRATE) return null
+        } else if (!silent) return null
+        val notifications = context.getSystemService(NotificationManager::class.java)
+        if (notifications.currentInterruptionFilter != NotificationManager.INTERRUPTION_FILTER_ALL) return null
+        val channel = notifications.getNotificationChannel(settings.reminderStyle.channelId) ?: return null
+        if (!channel.shouldVibrate() || channel.importance < NotificationManager.IMPORTANCE_DEFAULT) return null
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.VIBRATE) != PackageManager.PERMISSION_GRANTED) return null
+        val vibrator = vibrator(context)
+        return vibrator.takeIf { it.hasVibrator() }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun startVibration(context: Context, settings: DrinkSettings, vibrator: Vibrator, repeat: Boolean) {
+        try {
+            // Recheck system controls in case they changed while the notification was posted.
+            if (!permission(context, settings.reminderStyle) || manualVibrator(context, settings, repeat) == null) {
+                if (repeat) stopVibration(context)
+                return
+            }
+            val effect = if (repeat) {
+                if (vibrator.hasAmplitudeControl()) VibrationEffect.createWaveform(
+                    longArrayOf(0, 100, 180, 120, 1400), intArrayOf(0, 50, 110, 50, 0), 0)
+                else VibrationEffect.createWaveform(longArrayOf(0, 400, 1400), 0)
+            } else VibrationEffect.createWaveform(longArrayOf(0, 250, 120, 250), -1)
+            if (repeat) context.getSharedPreferences("vibration_runtime", Context.MODE_PRIVATE)
+                .edit().putBoolean("repeating", true).apply()
+            // Alarm vibration attributes keep reminders independent of silent notification mode.
+            if (Build.VERSION.SDK_INT >= 33) vibrator.vibrate(effect,
+                VibrationAttributes.Builder().setUsage(VibrationAttributes.USAGE_ALARM).build())
+            else vibrator.vibrate(effect, AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_ALARM).build())
+        } catch (error: RuntimeException) {
+            if (repeat) stopVibration(context)
+            Log.w("DrinkReminder", "Vibration could not be requested", error)
+        }
+    }
 
     fun createChannel(context: Context, style: ReminderStyle = currentSettings(context).reminderStyle) {
         val attributes = AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_NOTIFICATION)
@@ -78,10 +145,10 @@ object Reminders {
         val now = ZonedDateTime.now()
         val total = drinks.filter { it.date == now.toLocalDate() }.sumOf { it.amount }
         val previousDue = prefs.getLong(DUE, 0)
-        val keep = !reset && previousDue > 0 && !prefs.getString(TOKEN, null).isNullOrEmpty()
+        val keep = !reset && prefs.getInt("policyVersion", 0) == POLICY_VERSION && previousDue > 0 && !prefs.getString(TOKEN, null).isNullOrEmpty()
         val due = if (keep) previousDue else ReminderPolicy.next(now, settings, total >= settings.goal).toInstant().toEpochMilli()
         val token = if (keep) prefs.getString(TOKEN, "")!! else UUID.randomUUID().toString()
-        check(prefs.edit().putLong(DUE, due).putString(TOKEN, token).commit())
+        check(prefs.edit().putLong(DUE, due).putString(TOKEN, token).putInt("policyVersion", POLICY_VERSION).commit())
         val pending = alarmIntent(context, token)
         val trigger = due.coerceAtLeast(System.currentTimeMillis() + 1000)
         if (settings.preciseReminders && exactAllowed(context)) {
@@ -108,6 +175,10 @@ object Reminders {
     @Synchronized
     fun deliver(context: Context, token: String, fromWorker: Boolean = false) {
         val prefs = preferences(context)
+        if (prefs.getInt("policyVersion", 0) != POLICY_VERSION) {
+            restore(context, reset = true, fromWorker = fromWorker)
+            return
+        }
         val due = prefs.getLong(DUE, 0)
         val now = ZonedDateTime.now()
         if (!ReminderPolicy.shouldDeliver(token, prefs.getString(TOKEN, null), due, now.toInstant().toEpochMilli())) return
@@ -122,7 +193,7 @@ object Reminders {
                     if (ReminderPolicy.mayNotify(now, settings, total >= settings.goal)) notify(context, (settings.goal - total).coerceAtLeast(0), settings)
                 } finally { schedule(context, settings, drinks, fromWorker = fromWorker) }
             } catch (error: Exception) {
-                prefs.edit().putLong(DUE, due).putString(TOKEN, token).commit()
+                prefs.edit().putLong(DUE, due).putString(TOKEN, token).putInt("policyVersion", POLICY_VERSION).commit()
                 throw error
             }
         }
@@ -132,25 +203,45 @@ object Reminders {
         DrinkRepository(context).use { schedule(context, it.settings(), it.all(), reset = reset, fromWorker = fromWorker) }
     }
 
+    @Synchronized
     fun notify(context: Context, remaining: Int, settings: DrinkSettings = currentSettings(context), preview: Boolean = false): Boolean {
         createChannel(context, settings.reminderStyle)
         if (!permission(context, settings.reminderStyle)) return false
-        val open = PendingIntent.getActivity(context, 0, Intent(context, MainActivity::class.java), PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
-        val notification = NotificationCompat.Builder(context, settings.reminderStyle.channelId)
+        val repeatingVibrator = manualVibrator(context, settings, repeat = true)
+        val manualVibrator = repeatingVibrator ?: manualVibrator(context, settings, repeat = false)
+        val repeating = repeatingVibrator != null
+        stopVibration(context)
+        val openIntent = Intent(context, MainActivity::class.java)
+        if (repeating) openIntent.setAction(ACTION_OPEN_AND_STOP).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+        val open = PendingIntent.getActivity(context, if (repeating) 1004 else 0, openIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+        val builder = NotificationCompat.Builder(context, settings.reminderStyle.channelId)
             .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle(if (preview) "饮水提醒测试" else "喝口水，休息一下")
             .setContentText(when {
+                repeating -> "规律震动中，点此进入应用或选择停止震动。"
                 preview -> "当前方式：${settings.reminderStyle.label}"
                 remaining > 0 -> "今天距离目标还有 $remaining mL，补充一点水分吧。"
                 else -> "保持补水节奏，喝水后记得记录。"
             })
             .setCategory(NotificationCompat.CATEGORY_REMINDER)
-            .setContentIntent(open).setAutoCancel(true).build()
+            .setSilent(manualVibrator != null)
+            .setContentIntent(open).setAutoCancel(!repeating)
+        if (repeating) {
+            val stop = PendingIntent.getBroadcast(context, 1004, Intent(context, StopVibrationReceiver::class.java),
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+            builder.setOngoing(true).setDeleteIntent(stop)
+                .addAction(R.drawable.ic_notification, "停止震动", stop)
+        }
         return try {
-            NotificationManagerCompat.from(context).notify(if (preview) 1003 else 1001, notification)
+            NotificationManagerCompat.from(context).notify(if (repeating) REPEATING_NOTIFICATION else if (preview) 1003 else 1001, builder.build())
+            manualVibrator?.let { startVibration(context, settings, it, repeating) }
             true
         } catch (_: SecurityException) { false }
     }
+}
+
+class StopVibrationReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent) { Reminders.stopVibration(context) }
 }
 
 class ReminderWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {

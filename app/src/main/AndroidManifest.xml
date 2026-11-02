@@ -19,6 +19,7 @@
             </intent-filter>
         </activity>
         <receiver android:name=".ReminderReceiver" android:exported="false" />
+        <receiver android:name=".StopVibrationReceiver" android:exported="false" />
         <receiver android:name=".ReminderRestoreReceiver" android:exported="false">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
