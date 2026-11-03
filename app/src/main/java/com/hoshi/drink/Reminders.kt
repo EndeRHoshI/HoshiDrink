@@ -3,6 +3,7 @@ package com.hoshi.drink
 import android.Manifest
 import android.app.AlarmManager
 import android.app.NotificationChannel
+import android.app.Notification
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.BroadcastReceiver
@@ -10,14 +11,10 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.AudioAttributes
-import android.media.AudioManager
 import android.media.RingtoneManager
 import android.os.Build
-import android.os.VibrationAttributes
-import android.os.VibrationEffect
-import android.os.Vibrator
-import android.os.VibratorManager
-import android.util.Log
+import android.os.PowerManager
+import android.net.Uri
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
@@ -40,26 +37,9 @@ object Reminders {
     private const val BACKUP_DELAY = 5 * 60 * 1000L
     // Invalidate rolling countdowns saved by earlier app versions.
     internal const val POLICY_VERSION = 2
-    private const val REPEATING_NOTIFICATION = 1004
     const val ACTION_OPEN_AND_STOP = "com.hoshi.drink.OPEN_AND_STOP"
 
-    @Suppress("DEPRECATION")
-    private fun vibrator(context: Context): Vibrator =
-        if (Build.VERSION.SDK_INT >= 31) context.getSystemService(VibratorManager::class.java).defaultVibrator
-        else context.getSystemService(Vibrator::class.java)
-
-    @Synchronized
-    fun stopVibration(context: Context) {
-        val runtime = context.getSharedPreferences("vibration_runtime", Context.MODE_PRIVATE)
-        try {
-            if (runtime.getBoolean("repeating", false)) vibrator(context).cancel()
-        } catch (error: RuntimeException) {
-            Log.w("DrinkReminder", "Unable to cancel vibration", error)
-        } finally {
-            runtime.edit().putBoolean("repeating", false).apply()
-            context.getSystemService(NotificationManager::class.java).cancel(REPEATING_NOTIFICATION)
-        }
-    }
+    fun stopVibration(context: Context) = ReminderVibration.stop(context, "用户确认提醒")
 
     private fun preferences(context: Context) = context.getSharedPreferences("reminder_schedule", Context.MODE_PRIVATE)
 
@@ -72,46 +52,6 @@ object Reminders {
         context.getSystemService(AlarmManager::class.java).canScheduleExactAlarms()
 
     private fun currentSettings(context: Context) = DrinkRepository(context).use { it.settings() }
-
-    private fun manualVibrator(context: Context, settings: DrinkSettings, repeat: Boolean): Vibrator? {
-        if (!settings.reminderStyle.vibrate) return null
-        val silent = context.getSystemService(AudioManager::class.java).ringerMode == AudioManager.RINGER_MODE_SILENT
-        if (repeat) {
-            if (!settings.repeatVibration || settings.reminderStyle != ReminderStyle.VIBRATE) return null
-        } else if (!silent) return null
-        val notifications = context.getSystemService(NotificationManager::class.java)
-        if (notifications.currentInterruptionFilter != NotificationManager.INTERRUPTION_FILTER_ALL) return null
-        val channel = notifications.getNotificationChannel(settings.reminderStyle.channelId) ?: return null
-        if (!channel.shouldVibrate() || channel.importance < NotificationManager.IMPORTANCE_DEFAULT) return null
-        if (ContextCompat.checkSelfPermission(context, Manifest.permission.VIBRATE) != PackageManager.PERMISSION_GRANTED) return null
-        val vibrator = vibrator(context)
-        return vibrator.takeIf { it.hasVibrator() }
-    }
-
-    @Suppress("DEPRECATION")
-    private fun startVibration(context: Context, settings: DrinkSettings, vibrator: Vibrator, repeat: Boolean) {
-        try {
-            // Recheck system controls in case they changed while the notification was posted.
-            if (!permission(context, settings.reminderStyle) || manualVibrator(context, settings, repeat) == null) {
-                if (repeat) stopVibration(context)
-                return
-            }
-            val effect = if (repeat) {
-                if (vibrator.hasAmplitudeControl()) VibrationEffect.createWaveform(
-                    longArrayOf(0, 100, 180, 120, 1400), intArrayOf(0, 50, 110, 50, 0), 0)
-                else VibrationEffect.createWaveform(longArrayOf(0, 400, 1400), 0)
-            } else VibrationEffect.createWaveform(longArrayOf(0, 250, 120, 250), -1)
-            if (repeat) context.getSharedPreferences("vibration_runtime", Context.MODE_PRIVATE)
-                .edit().putBoolean("repeating", true).apply()
-            // Alarm vibration attributes keep reminders independent of silent notification mode.
-            if (Build.VERSION.SDK_INT >= 33) vibrator.vibrate(effect,
-                VibrationAttributes.Builder().setUsage(VibrationAttributes.USAGE_ALARM).build())
-            else vibrator.vibrate(effect, AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_ALARM).build())
-        } catch (error: RuntimeException) {
-            if (repeat) stopVibration(context)
-            Log.w("DrinkReminder", "Vibration could not be requested", error)
-        }
-    }
 
     fun createChannel(context: Context, style: ReminderStyle = currentSettings(context).reminderStyle) {
         val attributes = AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_NOTIFICATION)
@@ -137,9 +77,11 @@ object Reminders {
         val alarm = context.getSystemService(AlarmManager::class.java)
         val prefs = preferences(context)
         if (!settings.enabled) {
+            ReminderVibration.stop(context, "提醒已关闭")
             prefs.edit().clear().commit()
             alarm.cancel(alarmIntent(context, ""))
             if (!fromWorker) work.cancelUniqueWork(WORK)
+            ReminderDiagnostics.record(context, "取消定时提醒")
             return
         }
         val now = ZonedDateTime.now()
@@ -148,17 +90,21 @@ object Reminders {
         val keep = !reset && prefs.getInt("policyVersion", 0) == POLICY_VERSION && previousDue > 0 && !prefs.getString(TOKEN, null).isNullOrEmpty()
         val due = if (keep) previousDue else ReminderPolicy.next(now, settings, total >= settings.goal).toInstant().toEpochMilli()
         val token = if (keep) prefs.getString(TOKEN, "")!! else UUID.randomUUID().toString()
-        check(prefs.edit().putLong(DUE, due).putString(TOKEN, token).putInt("policyVersion", POLICY_VERSION).commit())
         val pending = alarmIntent(context, token)
         val trigger = due.coerceAtLeast(System.currentTimeMillis() + 1000)
+        var mode = "普通闹钟（可能延迟）"
         if (settings.preciseReminders && exactAllowed(context)) {
             try {
                 alarm.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, trigger, pending)
+                mode = "精确闹钟"
             } catch (_: SecurityException) {
                 // Permission can be revoked between the check and the system call.
                 alarm.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, trigger, pending)
             }
         } else alarm.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, trigger, pending)
+        check(prefs.edit().putLong(DUE, due).putString(TOKEN, token).putInt("policyVersion", POLICY_VERSION)
+            .putString("mode", mode).commit())
+        ReminderDiagnostics.record(context, "安排提醒", "计划=${ReminderDiagnostics.time(due)} 模式=$mode 精确权限=${exactAllowed(context)} 保留原任务=$keep 标识=${token.take(8)}")
 
         val backup = OneTimeWorkRequestBuilder<ReminderWorker>()
             .setInputData(workDataOf(TOKEN to token))
@@ -176,25 +122,29 @@ object Reminders {
     fun deliver(context: Context, token: String, fromWorker: Boolean = false) {
         val prefs = preferences(context)
         if (prefs.getInt("policyVersion", 0) != POLICY_VERSION) {
+            ReminderDiagnostics.record(context, "重排旧版本任务")
             restore(context, reset = true, fromWorker = fromWorker)
             return
         }
         val due = prefs.getLong(DUE, 0)
         val now = ZonedDateTime.now()
-        if (!ReminderPolicy.shouldDeliver(token, prefs.getString(TOKEN, null), due, now.toInstant().toEpochMilli())) return
+        val nowMillis = now.toInstant().toEpochMilli()
+        ReminderDiagnostics.record(context, "收到提醒", "来源=${if (fromWorker) "后台兜底" else "系统闹钟"} 标识=${token.take(8)} 计划=${ReminderDiagnostics.time(due)} 延迟=${nowMillis - due}ms")
+        if (!ReminderPolicy.shouldDeliver(token, prefs.getString(TOKEN, null), due, nowMillis)) {
+            ReminderDiagnostics.record(context, "忽略提醒", "过期标识、重复或尚未到点")
+            if (token == prefs.getString(TOKEN, null) && due > nowMillis) restore(context)
+            return
+        }
         DrinkRepository(context).use { repo ->
             val settings = repo.settings()
             val drinks = repo.all()
             val total = drinks.filter { it.date == now.toLocalDate() }.sumOf { it.amount }
-            // Claim a scheduled occurrence before either the alarm or its backup posts a notification.
-            check(prefs.edit().clear().commit())
-            try {
-                try {
-                    if (ReminderPolicy.mayNotify(now, settings, total >= settings.goal)) notify(context, (settings.goal - total).coerceAtLeast(0), settings)
-                } finally { schedule(context, settings, drinks, fromWorker = fromWorker) }
-            } catch (error: Exception) {
-                prefs.edit().putLong(DUE, due).putString(TOKEN, token).putInt("policyVersion", POLICY_VERSION).commit()
-                throw error
+            // Persist the next occurrence before notification/vibration code can fail.
+            schedule(context, settings, drinks, fromWorker = fromWorker)
+            if (ReminderPolicy.mayNotify(now, settings, total >= settings.goal)) {
+                notify(context, (settings.goal - total).coerceAtLeast(0), settings)
+            } else {
+                ReminderDiagnostics.record(context, "不发送通知", "已关闭、超出时段或达标暂停")
             }
         }
     }
@@ -203,14 +153,8 @@ object Reminders {
         DrinkRepository(context).use { schedule(context, it.settings(), it.all(), reset = reset, fromWorker = fromWorker) }
     }
 
-    @Synchronized
-    fun notify(context: Context, remaining: Int, settings: DrinkSettings = currentSettings(context), preview: Boolean = false): Boolean {
-        createChannel(context, settings.reminderStyle)
-        if (!permission(context, settings.reminderStyle)) return false
-        val repeatingVibrator = manualVibrator(context, settings, repeat = true)
-        val manualVibrator = repeatingVibrator ?: manualVibrator(context, settings, repeat = false)
-        val repeating = repeatingVibrator != null
-        stopVibration(context)
+    fun notification(context: Context, remaining: Int, settings: DrinkSettings, preview: Boolean,
+                     repeating: Boolean = false, session: String? = null, manual: Boolean = repeating): Notification {
         val openIntent = Intent(context, MainActivity::class.java)
         if (repeating) openIntent.setAction(ACTION_OPEN_AND_STOP).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
         val open = PendingIntent.getActivity(context, if (repeating) 1004 else 0, openIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
@@ -224,24 +168,55 @@ object Reminders {
                 else -> "保持补水节奏，喝水后记得记录。"
             })
             .setCategory(NotificationCompat.CATEGORY_REMINDER)
-            .setSilent(manualVibrator != null)
+            .setSilent(manual)
             .setContentIntent(open).setAutoCancel(!repeating)
         if (repeating) {
-            val stop = PendingIntent.getBroadcast(context, 1004, Intent(context, StopVibrationReceiver::class.java),
+            val stopIntent = Intent(context, StopVibrationReceiver::class.java).putExtra("session", session)
+                .setData(Uri.parse("hoshidrink://vibration/stop/${session.orEmpty()}"))
+            val stop = PendingIntent.getBroadcast(context, 1004, stopIntent,
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
             builder.setOngoing(true).setDeleteIntent(stop)
+                .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
                 .addAction(R.drawable.ic_notification, "停止震动", stop)
         }
+        return builder.build()
+    }
+
+    @Synchronized
+    fun notify(context: Context, remaining: Int, settings: DrinkSettings = currentSettings(context), preview: Boolean = false): Boolean {
+        createChannel(context, settings.reminderStyle)
+        if (!permission(context, settings.reminderStyle)) {
+            ReminderDiagnostics.record(context, "通知被关闭", settings.reminderStyle.channelId)
+            return false
+        }
+        stopVibration(context)
+        if (ReminderVibration.startRepeating(context, settings, preview)) return true
+        return postSingle(context, remaining, settings, preview)
+    }
+
+    fun postSingle(context: Context, remaining: Int, settings: DrinkSettings, preview: Boolean): Boolean {
+        if (!permission(context, settings.reminderStyle)) return false
+        val manual = settings.reminderStyle.vibrate && ReminderVibration.allowed(context, settings) &&
+            (ReminderVibration.silent(context) || (settings.repeatVibration && settings.reminderStyle == ReminderStyle.VIBRATE))
         return try {
-            NotificationManagerCompat.from(context).notify(if (repeating) REPEATING_NOTIFICATION else if (preview) 1003 else 1001, builder.build())
-            manualVibrator?.let { startVibration(context, settings, it, repeating) }
+            NotificationManagerCompat.from(context).notify(if (preview) 1003 else 1001,
+                notification(context, remaining, settings, preview, manual = manual))
+            ReminderDiagnostics.record(context, "通知请求已提交", "试发=$preview 渠道=${settings.reminderStyle.channelId}")
+            if (manual) ReminderVibration.pulse(context, settings, preview)
             true
-        } catch (_: SecurityException) { false }
+        } catch (error: RuntimeException) {
+            ReminderDiagnostics.record(context, "发送通知失败", error.javaClass.simpleName)
+            false
+        }
     }
 }
 
 class StopVibrationReceiver : BroadcastReceiver() {
-    override fun onReceive(context: Context, intent: Intent) { Reminders.stopVibration(context) }
+    override fun onReceive(context: Context, intent: Intent) {
+        val session = intent.getStringExtra("session")
+        if (session == null) Reminders.stopVibration(context)
+        else ReminderVibration.endSession(context, session, "通知停止按钮或划掉通知")
+    }
 }
 
 class ReminderWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
@@ -250,33 +225,45 @@ class ReminderWorker(context: Context, params: WorkerParameters) : CoroutineWork
         try {
             if (token == null) Reminders.restore(applicationContext, fromWorker = true)
             else Reminders.deliver(applicationContext, token, fromWorker = true)
-        } catch (_: Exception) { return Result.retry() }
+        } catch (error: Exception) {
+            ReminderDiagnostics.record(applicationContext, "兜底任务失败", error.javaClass.simpleName)
+            return Result.retry()
+        }
         return Result.success()
     }
 }
 
 private val receiverExecutor = Executors.newSingleThreadExecutor()
 
+private fun BroadcastReceiver.dispatch(context: Context, action: String, block: () -> Unit) {
+    // goAsync() keeps the broadcast alive, but does not hold the CPU awake after onReceive returns.
+    val wakeLock = context.getSystemService(PowerManager::class.java)
+        .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "HoshiDrink:ReminderReceiver")
+    wakeLock.acquire(10_000L)
+    val result = goAsync()
+    receiverExecutor.execute {
+        try { block() }
+        catch (error: Exception) { ReminderDiagnostics.record(context, "$action 失败", error.javaClass.simpleName) }
+        finally {
+            if (wakeLock.isHeld) wakeLock.release()
+            result.finish()
+        }
+    }
+}
+
 class ReminderReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         val token = intent.getStringExtra("token") ?: return
-        val result = goAsync()
-        receiverExecutor.execute {
-            try { Reminders.deliver(context.applicationContext, token) }
-            catch (error: Exception) { Log.e("DrinkReminder", "Alarm delivery failed; backup work will retry", error) }
-            finally { result.finish() }
-        }
+        dispatch(context, "闹钟广播") { Reminders.deliver(context.applicationContext, token) }
     }
 }
 
 class ReminderRestoreReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         val reset = intent.action == Intent.ACTION_TIME_CHANGED || intent.action == Intent.ACTION_TIMEZONE_CHANGED
-        val result = goAsync()
-        receiverExecutor.execute {
-            try { Reminders.restore(context.applicationContext, reset) }
-            catch (error: Exception) { Log.e("DrinkReminder", "Unable to restore reminder", error) }
-            finally { result.finish() }
+        dispatch(context, "恢复广播") {
+            ReminderDiagnostics.record(context, "恢复提醒", intent.action.orEmpty())
+            Reminders.restore(context.applicationContext, reset)
         }
     }
 }

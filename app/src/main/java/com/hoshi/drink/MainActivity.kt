@@ -4,6 +4,8 @@ import android.Manifest
 import android.app.TimePickerDialog
 import android.content.ActivityNotFoundException
 import android.content.Intent
+import android.content.ClipboardManager
+import android.content.ClipData
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
@@ -89,7 +91,7 @@ private val Scheme = lightColorScheme(primary = Forest, onPrimary = Color.White,
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        if (intent?.action == Reminders.ACTION_OPEN_AND_STOP) Reminders.stopVibration(this)
+        Reminders.stopVibration(applicationContext)
         enableEdgeToEdge(
             statusBarStyle = SystemBarStyle.light(
                 scrim = android.graphics.Color.TRANSPARENT,
@@ -107,7 +109,18 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        if (intent.action == Reminders.ACTION_OPEN_AND_STOP) Reminders.stopVibration(this)
+        Reminders.stopVibration(applicationContext)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        ReminderVibration.foreground(applicationContext, true)
+        ReminderDiagnostics.record(applicationContext, "界面恢复", intent?.action.orEmpty())
+    }
+
+    override fun onPause() {
+        ReminderVibration.foreground(applicationContext, false)
+        super.onPause()
     }
 }
 
@@ -418,6 +431,14 @@ private fun SettingsScreen(settings: DrinkSettings, onSettings: (DrinkSettings) 
     var unrestricted by remember { mutableStateOf(context.getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(context.packageName)) }
     var styleMenu by remember { mutableStateOf(false) }
     var pendingPreview by rememberSaveable { mutableStateOf(false) }
+    var scheduleSummary by remember { mutableStateOf(ReminderDiagnostics.summary(context)) }
+    var diagnosticReport by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(settings) {
+        while (true) {
+            scheduleSummary = ReminderDiagnostics.summary(context)
+            delay(10_000)
+        }
+    }
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     DisposableEffect(lifecycle, settings.reminderStyle) {
         val observer = LifecycleEventObserver { _, event -> if (event == Lifecycle.Event.ON_RESUME) {
@@ -488,6 +509,7 @@ private fun SettingsScreen(settings: DrinkSettings, onSettings: (DrinkSettings) 
             onSettings(settings.copy(start = 10 * 60, end = 18 * 60 + 30, interval = 60,
                 reminderStyle = ReminderStyle.VIBRATE, preciseReminders = true, stopAtGoal = false))
             scope.launch { snackbar.showSnackbar(if (settings.enabled) "已设置整点震动" else "已设置整点震动，开启提醒后生效") }
+            if (!exactAllowed) requestExactPermission()
         }, modifier = Modifier.padding(top = 14.dp), shape = RoundedCornerShape(6.dp)) {
             Icon(Icons.Outlined.Alarm, null, Modifier.size(17.dp))
             Spacer(Modifier.width(6.dp))
@@ -568,6 +590,7 @@ private fun SettingsScreen(settings: DrinkSettings, onSettings: (DrinkSettings) 
         HorizontalDivider(color = Line)
         Spacer(Modifier.height(28.dp))
         SectionTitle("提醒可靠性", "")
+        Text(scheduleSummary, color = Forest, fontSize = 12.sp, lineHeight = 21.sp, modifier = Modifier.padding(top = 12.dp))
         SettingSwitch("准时提醒", when {
             settings.preciseReminders && !exactAllowed -> "未允许闹钟权限，当前使用普通提醒"
             settings.preciseReminders -> "已启用，减少系统休眠造成的延迟"
@@ -577,6 +600,7 @@ private fun SettingsScreen(settings: DrinkSettings, onSettings: (DrinkSettings) 
             if (value && !exactAllowed) requestExactPermission()
         }
         if (settings.preciseReminders && !exactAllowed) {
+            Text("未获得闹钟权限，无法保证整点送达。", color = Coral, fontSize = 12.sp, modifier = Modifier.padding(top = 4.dp))
             TextButton(onClick = ::requestExactPermission) { Text("允许闹钟和提醒权限", fontSize = 12.sp) }
         }
         Row(Modifier.fillMaxWidth().clickable {
@@ -593,9 +617,15 @@ private fun SettingsScreen(settings: DrinkSettings, onSettings: (DrinkSettings) 
             Icon(Icons.Outlined.Settings, null, Modifier.size(16.dp)); Spacer(Modifier.width(6.dp)); Text("应用与后台设置", fontSize = 12.sp)
         }
         Text("部分机型需额外允许自启动和后台活动。强行停止应用后，需重新打开才能恢复提醒。", fontSize = 11.sp, lineHeight = 17.sp, color = Muted, modifier = Modifier.padding(top = 5.dp, bottom = 20.dp))
+        OutlinedButton(onClick = { diagnosticReport = ReminderDiagnostics.report(context) }, shape = RoundedCornerShape(6.dp)) {
+            Icon(Icons.Outlined.BugReport, null, Modifier.size(17.dp))
+            Spacer(Modifier.width(6.dp)); Text("查看提醒诊断", fontSize = 12.sp)
+        }
+        Text("排查整点未收到、通知被拦截或震动未停止。仅保存在本机。", color = Muted, fontSize = 11.sp, lineHeight = 17.sp,
+            modifier = Modifier.padding(top = 6.dp, bottom = 20.dp))
         HorizontalDivider(color = Line)
         Spacer(Modifier.height(28.dp))
-        SectionTitle("关于", "v1.1.0")
+        SectionTitle("关于", "v1.2.0")
         Row(Modifier.fillMaxWidth().padding(vertical = 20.dp), verticalAlignment = Alignment.Top) {
             Icon(Icons.Outlined.Lock, null, tint = Forest, modifier = Modifier.size(22.dp))
             Column(Modifier.padding(start = 14.dp)) {
@@ -606,6 +636,16 @@ private fun SettingsScreen(settings: DrinkSettings, onSettings: (DrinkSettings) 
         Text("每日目标仅用于习惯记录，并非医疗建议。饮水需求因人而异，请结合自身情况设置。", color = Muted, fontSize = 11.sp, lineHeight = 18.sp, modifier = Modifier.padding(top = 8.dp, bottom = 32.dp))
     }
     if (goalDialog) NumberDialog("每日饮水目标", "每日目标", settings.goal, 500..6000, "500–6000 mL", onDismiss = { goalDialog = false }) { onSettings(settings.copy(goal = it)); goalDialog = false }
+    diagnosticReport?.let { report ->
+        AlertDialog(onDismissRequest = { diagnosticReport = null }, title = { Text("提醒诊断") },
+            text = { Text(report, fontSize = 11.sp, lineHeight = 17.sp, modifier = Modifier.heightIn(max = 380.dp).verticalScroll(rememberScrollState())) },
+            confirmButton = { TextButton(onClick = {
+                context.getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText("HoshiDrink 提醒诊断", report))
+                diagnosticReport = null
+                scope.launch { snackbar.showSnackbar("诊断信息已复制") }
+            }) { Text("复制诊断") } },
+            dismissButton = { TextButton(onClick = { diagnosticReport = null }) { Text("关闭") } })
+    }
 }
 
 @Composable
