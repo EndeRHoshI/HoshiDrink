@@ -39,6 +39,9 @@ object ReminderVibration {
     }
 
     @Synchronized
+    fun isForeground(): Boolean = resumed
+
+    @Synchronized
     fun allowed(context: Context, settings: DrinkSettings): Boolean {
         return blockedReason(context, settings) == null
     }
@@ -66,10 +69,6 @@ object ReminderVibration {
         if (!settings.repeatVibration || settings.reminderStyle != ReminderStyle.VIBRATE) return false
         blockedReason(context, settings)?.let { reason ->
             ReminderDiagnostics.record(context, "持续震动条件不满足", reason, fields = mapOf("traceId" to trace))
-            return false
-        }
-        if (resumed && !preview) {
-            ReminderDiagnostics.record(context, "震动跳过", "用户正在应用内", fields = mapOf("traceId" to trace))
             return false
         }
         stop(context, "替换上一条提醒")
@@ -103,7 +102,9 @@ object ReminderVibration {
     @Synchronized
     fun beginSession(context: Context, id: String, settings: DrinkSettings, preview: Boolean): Boolean {
         val blocked = blockedReason(context, settings)
-        if (session != id || (resumed && !preview) || blocked != null) {
+        // A reminder may begin while the app is already visible. Entering the app or pressing
+        // stop invalidates the session, which still prevents a queued service from restarting it.
+        if (session != id || blocked != null) {
             ReminderDiagnostics.record(context, "震动启动被取消", fields = mapOf("sessionId" to id, "currentSessionId" to session,
                 "traceId" to traceId, "foreground" to resumed, "preview" to preview, "blockedReason" to blocked))
             return false
@@ -122,13 +123,15 @@ object ReminderVibration {
     @Synchronized
     fun pulse(context: Context, settings: DrinkSettings, preview: Boolean, trace: String? = null): Boolean {
         val blocked = blockedReason(context, settings)
-        if ((resumed && !preview) || blocked != null) {
-            ReminderDiagnostics.record(context, "短震动跳过", fields = mapOf("traceId" to trace, "foreground" to resumed, "preview" to preview, "blockedReason" to blocked))
+        if (blocked != null) {
+            ReminderDiagnostics.record(context, "短震动跳过", fields = mapOf("traceId" to trace, "foreground" to resumed,
+                "preview" to preview, "blockedReason" to blocked))
             return false
         }
         return try {
             vibrate(context, VibrationEffect.createWaveform(longArrayOf(0, 250, 120, 250), -1))
-            ReminderDiagnostics.record(context, "短震动请求已提交", fields = mapOf("traceId" to trace))
+            ReminderDiagnostics.record(context, "短震动请求已提交", fields = mapOf("traceId" to trace, "foreground" to resumed,
+                "preview" to preview))
             true
         } catch (error: RuntimeException) {
             ReminderDiagnostics.record(context, "短震动失败", error = error, fields = mapOf("traceId" to trace))

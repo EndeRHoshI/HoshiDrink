@@ -238,13 +238,16 @@ object Reminders {
             ReminderDiagnostics.record(context, "单次通知被关闭", fields = mapOf("traceId" to traceId, "channelId" to settings.reminderStyle.channelId))
             return false
         }
+        val foreground = ReminderVibration.isForeground()
         val manual = settings.reminderStyle.vibrate && ReminderVibration.allowed(context, settings) &&
-            (ReminderVibration.silent(context) || (settings.repeatVibration && settings.reminderStyle == ReminderStyle.VIBRATE))
+            (foreground || ReminderVibration.silent(context) || (settings.repeatVibration && settings.reminderStyle == ReminderStyle.VIBRATE))
         return try {
             NotificationManagerCompat.from(context).notify(if (preview) 1003 else 1001,
                 notification(context, remaining, settings, preview, manual = manual))
             ReminderDiagnostics.record(context, "通知请求已提交", fields = mapOf("traceId" to traceId, "preview" to preview,
-                "notificationId" to if (preview) 1003 else 1001, "channelId" to settings.reminderStyle.channelId, "manualVibration" to manual))
+                "notificationId" to if (preview) 1003 else 1001, "channelId" to settings.reminderStyle.channelId,
+                "manualVibration" to manual, "foreground" to foreground))
+            // Used when repeating is disabled or its service cannot start, in either app state.
             if (manual) ReminderVibration.pulse(context, settings, preview, traceId)
             true
         } catch (error: RuntimeException) {

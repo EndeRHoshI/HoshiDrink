@@ -40,4 +40,4 @@ device_adb shell dumpsys package com.hoshi.drink |
     awk '/versionCode=|versionName=|lastUpdateTime=|stopped=|android.permission.VIBRATE|android.permission.POST_NOTIFICATIONS|android.permission.SCHEDULE_EXACT_ALARM/ { print }' > "$output_dir/package-state.txt" || true
 device_adb shell cmd appops get com.hoshi.drink SCHEDULE_EXACT_ALARM > "$output_dir/exact-alarm-permission.txt" 2>&1 || true
 
-echo "已保存到 $output_dir。日志中的 API 成功记录不等于系统实际展示或马达实际震动。"
+echo "已保存到 ${output_dir}。日志中的 API 成功记录不等于系统实际展示或马达实际震动。"
