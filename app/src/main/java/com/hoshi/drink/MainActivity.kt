@@ -64,6 +64,8 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneId
@@ -91,7 +93,8 @@ private val Scheme = lightColorScheme(primary = Forest, onPrimary = Color.White,
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        Reminders.stopVibration(applicationContext)
+        ReminderDiagnostics.record(applicationContext, "Activity 创建", fields = mapOf("restored" to (savedInstanceState != null), "action" to intent?.action))
+        Reminders.stopVibration(applicationContext, "Activity 创建时确认提醒")
         enableEdgeToEdge(
             statusBarStyle = SystemBarStyle.light(
                 scrim = android.graphics.Color.TRANSPARENT,
@@ -109,18 +112,31 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        Reminders.stopVibration(applicationContext)
+        ReminderDiagnostics.record(applicationContext, "Activity 新 Intent", fields = mapOf("action" to intent.action))
+        Reminders.stopVibration(applicationContext, "Activity 收到新 Intent 时确认提醒")
     }
 
     override fun onResume() {
         super.onResume()
         ReminderVibration.foreground(applicationContext, true)
         ReminderDiagnostics.record(applicationContext, "界面恢复", intent?.action.orEmpty())
+        ReminderDiagnostics.snapshot(applicationContext, "界面恢复")
     }
 
     override fun onPause() {
+        ReminderDiagnostics.record(applicationContext, "界面暂停")
         ReminderVibration.foreground(applicationContext, false)
         super.onPause()
+    }
+
+    override fun onStop() {
+        ReminderDiagnostics.record(applicationContext, "界面停止")
+        super.onStop()
+    }
+
+    override fun onDestroy() {
+        ReminderDiagnostics.record(applicationContext, "Activity 销毁", fields = mapOf("finishing" to isFinishing, "configurationChange" to isChangingConfigurations))
+        super.onDestroy()
     }
 }
 
@@ -433,6 +449,22 @@ private fun SettingsScreen(settings: DrinkSettings, onSettings: (DrinkSettings) 
     var pendingPreview by rememberSaveable { mutableStateOf(false) }
     var scheduleSummary by remember { mutableStateOf(ReminderDiagnostics.summary(context)) }
     var diagnosticReport by remember { mutableStateOf<String?>(null) }
+    var diagnosticsBusy by remember { mutableStateOf(false) }
+    val exportLogs = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { uri ->
+        if (uri != null) scope.launch {
+            diagnosticsBusy = true
+            try {
+                withContext(Dispatchers.IO) {
+                    ReminderDiagnostics.record(context, "用户导出诊断")
+                    ReminderDiagnostics.export(context, uri)
+                }
+                snackbar.showSnackbar("诊断日志已导出")
+            } catch (error: Exception) {
+                ReminderDiagnostics.record(context, "导出诊断失败", error = error)
+                snackbar.showSnackbar("导出失败，请重试")
+            } finally { diagnosticsBusy = false }
+        }
+    }
     LaunchedEffect(settings) {
         while (true) {
             scheduleSummary = ReminderDiagnostics.summary(context)
@@ -450,14 +482,21 @@ private fun SettingsScreen(settings: DrinkSettings, onSettings: (DrinkSettings) 
         onDispose { lifecycle.removeObserver(observer) }
     }
     fun openSettings(intent: Intent) {
+        ReminderDiagnostics.record(context, "打开系统设置", intent.action.orEmpty())
         try { context.startActivity(intent) }
-        catch (_: ActivityNotFoundException) { scope.launch { snackbar.showSnackbar("请在系统应用设置中管理 HoshiDrink 的权限") } }
+        catch (error: ActivityNotFoundException) {
+            ReminderDiagnostics.record(context, "系统设置入口不可用", intent.action.orEmpty(), error = error)
+            scope.launch { snackbar.showSnackbar("请在系统应用设置中管理 HoshiDrink 的权限") }
+        }
     }
     fun preview() {
+        ReminderDiagnostics.record(context, "用户试发提醒", settings.reminderStyle.name)
         val sent = Reminders.notify(context, 0, settings, preview = true)
         scope.launch { snackbar.showSnackbar(if (sent) "测试通知已发送" else "请先允许系统通知") }
     }
     val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        ReminderDiagnostics.record(context, "通知权限返回", fields = mapOf("granted" to granted, "preview" to pendingPreview))
+        ReminderDiagnostics.snapshot(context, "通知权限返回")
         permission = granted && Reminders.permission(context, settings.reminderStyle)
         if (permission) {
             if (pendingPreview) preview() else onSettings(settings.copy(enabled = true))
@@ -617,11 +656,26 @@ private fun SettingsScreen(settings: DrinkSettings, onSettings: (DrinkSettings) 
             Icon(Icons.Outlined.Settings, null, Modifier.size(16.dp)); Spacer(Modifier.width(6.dp)); Text("应用与后台设置", fontSize = 12.sp)
         }
         Text("部分机型需额外允许自启动和后台活动。强行停止应用后，需重新打开才能恢复提醒。", fontSize = 11.sp, lineHeight = 17.sp, color = Muted, modifier = Modifier.padding(top = 5.dp, bottom = 20.dp))
-        OutlinedButton(onClick = { diagnosticReport = ReminderDiagnostics.report(context) }, shape = RoundedCornerShape(6.dp)) {
+        OutlinedButton(onClick = {
+            scope.launch {
+                diagnosticsBusy = true
+                try { diagnosticReport = withContext(Dispatchers.IO) { ReminderDiagnostics.report(context) } }
+                catch (error: Exception) {
+                    ReminderDiagnostics.record(context, "读取诊断失败", error = error)
+                    snackbar.showSnackbar("读取诊断失败，可连接电脑拉取日志")
+                } finally { diagnosticsBusy = false }
+            }
+        }, enabled = !diagnosticsBusy, shape = RoundedCornerShape(6.dp)) {
             Icon(Icons.Outlined.BugReport, null, Modifier.size(17.dp))
             Spacer(Modifier.width(6.dp)); Text("查看提醒诊断", fontSize = 12.sp)
         }
-        Text("排查整点未收到、通知被拦截或震动未停止。仅保存在本机。", color = Muted, fontSize = 11.sp, lineHeight = 17.sp,
+        TextButton(onClick = {
+            exportLogs.launch("HoshiDrink-diagnostics-${System.currentTimeMillis()}.zip")
+        }, enabled = !diagnosticsBusy) {
+            Icon(Icons.Outlined.FileDownload, null, Modifier.size(17.dp))
+            Spacer(Modifier.width(6.dp)); Text("导出完整日志", fontSize = 12.sp)
+        }
+        Text("默认记录，最多保留约 7 MiB。仅存本机，可导出或连接电脑拉取。", color = Muted, fontSize = 11.sp, lineHeight = 17.sp,
             modifier = Modifier.padding(top = 6.dp, bottom = 20.dp))
         HorizontalDivider(color = Line)
         Spacer(Modifier.height(28.dp))
